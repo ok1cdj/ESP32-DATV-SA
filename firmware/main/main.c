@@ -1181,11 +1181,17 @@ void app_main(void) {
         e = nvs_flash_init();
     }
     ESP_ERROR_CHECK(e);
+    uint8_t sr0 = UINT8_MAX;                     /* the built-in symbol rate (beacon_cfg.h) must be one of the panel's */
+    for (uint8_t i = 0; i < panel_nsr; ++i)
+        if (panel_sr_baud[i] == BEACON_BAUD) sr0 = i;
+    if (sr0 == UINT8_MAX) {
+        say("ERR beacon: BEACON_BAUD %lu is not in panel_sr_baud\r\n", (unsigned long)BEACON_BAUD);
+        abort();
+    }
     const panel_cfg_t defaults = {
-        .tx = 1, .pa = BEACON_PA, .pilots = BEACON_PILOTS, .sr = 2, .fkhz = BEACON_FREQ_KHZ,
+        .tx = 1, .pa = BEACON_PA, .pilots = BEACON_PILOTS, .sr = sr0, .fkhz = BEACON_FREQ_KHZ,
         .level_db = (int8_t)lroundf(20.0f * log10f(BEACON_AMP / 300.0f)), .service = BEACON_SERVICE, .provider = BEACON_PROVIDER,
     };
-    _Static_assert(BEACON_BAUD == 333000u, "panel_sr_baud[2] is the built-in symbol rate");
     panel_init(&defaults);                       /* settings saved by the front panel replace the defaults */
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
