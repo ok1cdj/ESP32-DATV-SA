@@ -15,7 +15,7 @@ After flashing, the board transmits a DVB-S2 test card on its own as soon as it 
 | Level | low (−27 dB below the usual level) |
 | Standard | DVB-S2, QPSK, FEC 3/4, pilots on, roll-off 0.35 |
 | Symbol rate | 333 kS/s |
-| Service | `yATOLYE-TV` / `Technology Community` |
+| Service | `yATOLYE-TV` / `TEST PATTERN` |
 
 ## What you need
 
@@ -47,6 +47,13 @@ That is all. Tune your DVB-S2 receiver (MiniTiouner, SDRangel, a satellite set-t
 downconverter, …) to the settings in the table above. With the optional OLED / encoder
 front panel you can change frequency, level, symbol rate and the names on the device
 (see the [main README](https://github.com/barisdinc/ESP32-DATV-SA#front-panel)).
+
+## Your own video (optional)
+
+Instead of the test card the board can loop a video of up to about 35 seconds stored in its flash at **`0x110000`**;
+the video can be changed without changing the firmware. How to prepare the video and write it with esptool-js
+(together with the firmware, or the video alone): **[Storing and playing video from internal flash](VIDEO.md)**.
+The video file can be made in the browser, nothing to install: **<https://barisdinc.github.io/ESP32-DATV-SA/converter/>**
 
 ## If something does not work
 
@@ -81,7 +88,7 @@ kurmanız gerekmez** — ne ESP-IDF, ne Python, ne sürücü. Windows, macOS ve 
 tarayıcısı yeterlidir.
 
 Yüklemeden sonra kart, elektrik verildiği anda kendi kendine bir DVB-S2 test yayını yapar:
-**2300.500 MHz, DVB-S2 QPSK 3/4, 333 kS/s, pilotlar açık, düşük seviye (−27 dB)**, servis adı `yATOLYE-TV` / `Technology Community`.
+**2300.500 MHz, DVB-S2 QPSK 3/4, 333 kS/s, pilotlar açık, düşük seviye (−27 dB)**, servis adı `yATOLYE-TV` / `TEST PATTERN`.
 
 ### Gerekenler
 
@@ -106,6 +113,13 @@ Yüklemeden sonra kart, elektrik verildiği anda kendi kendine bir DVB-S2 test y
    - yanındaki dosya düğmesiyle (*Dosya Seç* / *Choose File*) indirdiğiniz `.bin` dosyasını seçin.
 7. **Program**'a tıklayın ve %100 olmasını bekleyin (yaklaşık yarım dakika).
 8. Kartı çıkarıp tekrar takın (veya **RST** düğmesine basın). Kart artık yayında.
+
+### Kendi videonuz (isteğe bağlı)
+
+Kart, test yayını yerine flash belleğinde **`0x110000`** adresinde saklanan, en fazla ~35 saniyelik bir videoyu
+döngüde yayınlayabilir; video firmware değişmeden değiştirilebilir. Videonun nasıl hazırlanacağı ve esptool-js ile
+nasıl yükleneceği (firmware ile birlikte ya da yalnızca video): **[Dahili flash'tan video saklama ve yayınlama](VIDEO.md#türkçe)**.
+Video dosyası tarayıcıda, hiçbir şey kurmadan hazırlanabilir: **<https://barisdinc.github.io/ESP32-DATV-SA/converter/>**
 
 ### Sorun giderme
 
