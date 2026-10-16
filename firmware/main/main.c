@@ -16,9 +16,10 @@
  *   PA 0|1   arm GPIO3 for the next transmission; PA queries armed state / pin level
  *   QPSKT f_MHz baud sps [amp [seconds [ifm [target [dcI dcQ [g phi]]]]]]   see qpsk_lut.h and README.md
  *   PSK8T ...same arguments   8PSK from the generic loop (3 bit symbols, 16..64 samples per symbol at 8 MS/s)
- *   BDC [GET [f_MHz] | i q | SAVE | LIST | RESET | TEST on [f_MHz] | off]   beacon DC correction [DAC codes] against the carrier
- *                              leakage: show / set by hand and restart the beacon / keep for the current frequency in the NVS table /
- *                              list it / back to the built-in values of beacon_cfg.h / transmit the leakage alone (calibration)
+ *   BDC [GET [f_MHz] | i q | SAVE | PUT f_MHz i q | LIST | RESET | TEST on [f_MHz] | off]   beacon DC correction [DAC codes]
+ *                              against the carrier leakage: show / set by hand and restart the beacon / keep for the current frequency
+ *                              in the NVS table / put an entry into it / list it / back to the built-in values of beacon_cfg.h /
+ *                              transmit the leakage alone (calibration)
  * After power-up, until the host sends anything, the firmware transmits a built-in DVB-S2 beacon, or the video in the "video"
  * partition when there is one (see beacon_run).
  *
@@ -1703,6 +1704,19 @@ static void handle(char *line) {
                 say("ERR BDC TEST on [f_MHz 2300..2450] | off\r\n");
                 return;
             }
+        } else if (!strncmp(arg, "PUT ", 4)) {                       /* an entry of the table as it is, without transmitting */
+            char *e0, *e1, *e2;
+            const double mhz = strtod(arg + 4, &e0);
+            const float i = strtof(e0, &e1), q = strtof(e1, &e2);
+            if (e0 == arg + 4 || e1 == e0 || e2 == e1 || *e2 || mhz < TX_FMIN_KHZ / 1000.0 || mhz > TX_FMAX_KHZ / 1000.0 || !dc_ok(i, q)) {
+                say("ERR BDC PUT f_MHz i q\r\n");
+                return;
+            }
+            const uint32_t f = (uint32_t)llround(mhz * 1000.0);
+            if (!dct_put(f, i, q)) say("ERR BDC PUT%s\r\n", dct_n == DCT_MAX ? " (table full: BDC RESET)" : "");
+            dc_say(f);
+            beacon_restart = true;
+            return;
         } else if (!strcmp(arg, "SAVE")) {
             float i, q;
             const char *src;
@@ -1716,7 +1730,7 @@ static void handle(char *line) {
             char *e1, *e2;
             const float i = strtof(arg, &e1), q = strtof(e1, &e2);
             if (e1 == arg || e2 == e1 || *e2 || !dc_ok(i, q)) {
-                say("ERR BDC i q (DAC codes, -512..512) | GET [f_MHz] | SAVE | LIST | RESET | TEST on [f_MHz] | off\r\n");
+                say("ERR BDC i q (DAC codes, -512..512) | GET [f_MHz] | SAVE | PUT f_MHz i q | LIST | RESET | TEST on [f_MHz] | off\r\n");
                 return;
             }
             dc_hand[0] = i;

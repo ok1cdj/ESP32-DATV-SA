@@ -224,7 +224,8 @@ levels it limits reception. `--cal cal.json` (the format of `tx_dvbs.py --cal`) 
 `--iq-phase` build a DC / I/Q correction into the beacon; the USB command `BDC i q` sets the DC correction at run time
 and restarts the beacon at once (for nulling the tone while watching it on a receiver). The leakage and its correction
 depend on the frequency: `BDC SAVE` keeps the current value in an NVS table for the current frequency (up to 16 entries,
-they win over the built-in values; the beacon interpolates between them), `BDC LIST` lists the table, `BDC RESET`
+they win over the built-in values; the beacon interpolates between them), `BDC PUT f_MHz i q` writes an entry as it is
+(e.g. to restore a table after erasing the flash), `BDC LIST` lists the table, `BDC RESET`
 clears it and `BDC` / `BDC GET [f_MHz]` shows the value in use (`BDC i q (hand|table|saved|built-in) F f_kHz TEST 0|1`).
 `BDC TEST on [f_MHz]` transmits the leakage alone for calibration (no modulation, the PA off, the DC correction dithered
 to a fraction of a code), at `f_MHz` or the beacon's frequency; it is never saved, and 120 s after the last `BDC` command
