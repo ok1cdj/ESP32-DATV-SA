@@ -1322,6 +1322,53 @@ static void dc_test_table(int32_t *T, uint32_t S, float dci, float dcq) {
     }
 }
 
+/* BDC TEST: a command line read while the transmitter keeps running (interrupts are off; the DAC holds its last word meanwhile).
+ * "BDC i q", "BDC" and "BDC GET" are answered here: a new correction only rewrites group 0 of the table, the PHY stays as it is
+ * (stopping and starting the transmitter calibrates the PHY afresh, which moves the leakage by tenths of a code). Any other line
+ * goes to dc_pending for the main loop. Returns true to go on transmitting. */
+static char dc_pending[128];
+
+static bool dc_test_line(int32_t *T, uint32_t S) {
+    char line[128];
+    size_t n = 0;
+    const uint32_t t0 = ccount();
+    for (;;) {
+        uint8_t ch;
+        if (usb_serial_jtag_ll_read_rxfifo(&ch, 1)) {
+            usb_stalled = false;
+            if (ch == '\r') continue;
+            if (ch == '\n') break;
+            if (n < sizeof(line) - 1) line[n++] = (char)ch;
+        } else if (ccount() - t0 > CPU_HZ / 10) {                  /* no end of line within 0.1 s */
+            break;
+        }
+    }
+    line[n] = 0;
+    if (!n) return true;
+    const char *arg = line + 3;
+    while (*arg == ' ') ++arg;
+    if (!strncmp(line, "BDC", 3) && (line[3] == 0 || line[3] == ' ')) {
+        char *e1, *e2;
+        const float i = strtof(arg, &e1), q = strtof(e1, &e2);
+        if (!*arg || !strcmp(arg, "GET")) {
+            dc_test_until = esp_timer_get_time() + DCT_TEST_US;
+            dc_say(dc_fkhz());
+            return true;
+        }
+        if (e1 != arg && e2 != e1 && !*e2 && dc_ok(i, q)) {
+            dc_hand[0] = i;
+            dc_hand[1] = q;
+            dc_by_hand = true;
+            dc_test_table(T, S, i, q);
+            dc_test_until = esp_timer_get_time() + DCT_TEST_US;
+            dc_say(dc_fkhz());
+            return true;
+        }
+    }
+    strcpy(dc_pending, line);
+    return false;
+}
+
 static int beacon_run(void) {
     const panel_cfg_t *p = &panel_cfg;
     const bool test = dc_test;
@@ -1407,7 +1454,7 @@ static int beacon_run(void) {
     const uint32_t chunk_cyc = chunk * c->sper + (uint32_t)(carry / c->div), chunk_rem = (uint32_t)(carry % c->div);
     /* BDC TEST: the chunks left until its time is up (a chunk lasts chunk_cyc CPU cycles) */
     const int64_t left_us = test ? dc_test_until - esp_timer_get_time() : 0;
-    const uint64_t test_chunks = left_us > 0 ? (uint64_t)left_us * (CPU_HZ / 1000000u) / chunk_cyc : 0;
+    uint64_t test_chunks = left_us > 0 ? (uint64_t)left_us * (CPU_HZ / 1000000u) / chunk_cyc : 0;
     if (test && !test_chunks) {
         free(T);
         free(loop);
@@ -1443,7 +1490,15 @@ static int beacon_run(void) {
         if (v) lutf_run_p20(&fx);
         else lutb_run_p20(c);
         ++chunks;
-        if (c->exitc == 3) { why = 3; break; }                       /* a byte from the host */
+        if (c->exitc == 3) {                                         /* a byte from the host */
+            if (test && dc_test_line(T, S)) {                        /* BDC TEST: a new correction, the transmitter stays on */
+                test_chunks = chunks + (uint64_t)DCT_TEST_US * (CPU_HZ / 1000000u) / chunk_cyc;
+                c->tn = c->trx = ccount() + 20000;
+                continue;
+            }
+            why = 3;
+            break;
+        }
         if (panel_latched()) { why = 4; break; }
         if (test && chunks >= test_chunks) { why = 5; break; }       /* BDC TEST: time is up */
         c->tn = c->trx = tn + chunk_cyc + (ph + chunk_rem >= c->div ? 1u : 0u);
@@ -1617,12 +1672,14 @@ static void handle(char *line) {
                 return;
             }
             dc_say(*f ? (uint32_t)llround(mhz * 1000.0) : dc_fkhz());
-            return;                                                  /* nothing changed: no restart */
+            beacon_restart = true;                                   /* the command's byte stopped the beacon: on again */
+            return;
         }
         if (!strcmp(arg, "LIST")) {
             say("BDCT %lu\r\n", (unsigned long)dct_n);
             for (uint32_t k = 0; k < dct_n; ++k)
                 say("BDCT %lu %.3f %.3f\r\n", (unsigned long)dct[k].fkhz, (double)dct[k].i, (double)dct[k].q);
+            beacon_restart = true;
             return;
         }
         if (!strncmp(arg, "TEST", 4) && (arg[4] == 0 || arg[4] == ' ')) {
@@ -1721,6 +1778,15 @@ void app_main(void) {
                 used = 0;
                 resume_at = esp_timer_get_time() + BEACON_IDLE_US;
                 panel_show("STANDBY", false, 0, "PC on USB", NULL, "Any key: local", NULL);
+                if (dc_pending[0]) {             /* a line BDC TEST read already */
+                    handle(dc_pending);
+                    dc_pending[0] = 0;
+                    if (beacon_restart) {
+                        beacon_restart = false;
+                        failed = false;
+                        resume_at = 0;
+                    }
+                }
             } else if (why == 4) {
                 panel_wake();
             } else if (why == 5) {               /* BDC TEST forgotten: off, as after INFO, until a command or a reset */
