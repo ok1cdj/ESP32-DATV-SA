@@ -16,8 +16,9 @@
  *   PA 0|1   arm GPIO3 for the next transmission; PA queries armed state / pin level
  *   QPSKT f_MHz baud sps [amp [seconds [ifm [target [dcI dcQ [g phi]]]]]]   see qpsk_lut.h and README.md
  *   PSK8T ...same arguments   8PSK from the generic loop (3 bit symbols, 16..64 samples per symbol at 8 MS/s)
- *   BDC [i q | SAVE | RESET]   beacon DC correction [DAC codes] against the carrier leakage: show / set and restart the beacon /
- *                              keep in NVS / back to the built-in values of beacon_cfg.h
+ *   BDC [GET [f_MHz] | i q | SAVE | LIST | RESET | TEST on [f_MHz] | off]   beacon DC correction [DAC codes] against the carrier
+ *                              leakage: show / set by hand and restart the beacon / keep for the current frequency in the NVS table /
+ *                              list it / back to the built-in values of beacon_cfg.h / transmit the leakage alone (calibration)
  * After power-up, until the host sends anything, the firmware transmits a built-in DVB-S2 beacon, or the video in the "video"
  * partition when there is one (see beacon_run).
  *
@@ -1041,9 +1042,15 @@ extern uint32_t lutb_run_p20(lutg_ctx_t *c);
 static bool host_seen;
 
 /* DC correction of the beacon [DAC codes] against the carrier leakage of the DAC / mixer: a fixed tone in the middle of the
- * signal that does not scale with the level, so it ends reception at low levels (about -10 dBc). Built-in values from
- * beacon_cfg.h (make_beacon.py --dc-i/--dc-q/--cal), replaced by those saved with "BDC SAVE" (NVS "beacon"/"dc").
- * "BDC i q" sets them and restarts the beacon at once, for nulling the leakage with a receiver. */
+ * signal that does not scale with the level, so it ends reception at low levels (about -10 dBc). The leakage and its correction
+ * depend on the frequency, so "BDC SAVE" keeps a table of up to DCT_MAX frequencies (NVS "beacon"/"dct"); the beacon takes the value
+ * for its frequency from it, linearly interpolated, the nearest entry outside the table. Without a table: the single value of older
+ * firmware (NVS "beacon"/"dc"), else the built-in one of beacon_cfg.h (make_beacon.py --dc-i/--dc-q/--cal).
+ * "BDC i q" sets a value by hand and restarts the beacon at once, for nulling the leakage with a receiver; it holds for every
+ * frequency until BDC SAVE / RESET or a reset.
+ * "BDC TEST on [f_MHz]": the leakage alone (no modulation, only the DC correction, dithered to a fraction of a code), at f_MHz or the
+ * beacon's frequency, without the PA; never saved, off after a reset, and after DCT_TEST_US without a BDC command the transmitter
+ * goes off (as after INFO). */
 #ifndef BEACON_FRAME_SHORT                                       /* beacon_cfg.h from before short frames */
 #define BEACON_FRAME_SHORT 0
 #endif
@@ -1053,34 +1060,99 @@ static bool host_seen;
 #define BEACON_IQ_GAIN  1.0f
 #define BEACON_IQ_PHASE 0.0f
 #endif
-static float beacon_dc[2] = {BEACON_DC_I, BEACON_DC_Q};
-static bool beacon_dc_saved;                    /* beacon_dc came from NVS */
+#define DCT_MAX     16
+#define DCT_TEST_US 120000000LL
+#define DC_TEST_BAUD    40000u                  /* S = 200 at 8 MS/s */
+#define DC_TEST_SYMBOLS 4000u
+typedef struct { uint32_t fkhz; float i, q; } dct_entry_t;
+static dct_entry_t dct[DCT_MAX];                /* sorted by frequency */
+static uint32_t dct_n;
+static float beacon_dc[2] = {BEACON_DC_I, BEACON_DC_Q};     /* without a table: the built-in or the old single saved value */
+static bool beacon_dc_saved;                    /* beacon_dc came from NVS ("dc") */
+static float dc_hand[2];                        /* BDC i q */
+static bool dc_by_hand;
 static bool beacon_restart;                     /* BDC: start the beacon again at once */
+static bool dc_test;                            /* BDC TEST on */
+static uint32_t dc_test_fkhz;                   /* 0: the beacon's frequency */
+static int64_t dc_test_until;                   /* esp_timer time */
+
+static bool dc_ok(float i, float q) { return fabsf(i) <= 512.0f && fabsf(q) <= 512.0f; }
 
 static void beacon_dc_load(void) {
     nvs_handle_t h;
     if (nvs_open("beacon", NVS_READONLY, &h) != ESP_OK) return;
     float v[2];
     size_t n = sizeof(v);
-    if (nvs_get_blob(h, "dc", v, &n) == ESP_OK && n == sizeof(v) && fabsf(v[0]) <= 512.0f && fabsf(v[1]) <= 512.0f) {
+    if (nvs_get_blob(h, "dc", v, &n) == ESP_OK && n == sizeof(v) && dc_ok(v[0], v[1])) {
         beacon_dc[0] = v[0];
         beacon_dc[1] = v[1];
         beacon_dc_saved = true;
     }
+    n = sizeof(dct);
+    if (nvs_get_blob(h, "dct", dct, &n) == ESP_OK && n % sizeof(dct_entry_t) == 0) {
+        dct_n = (uint32_t)(n / sizeof(dct_entry_t));
+        for (uint32_t k = 0; k < dct_n; ++k)
+            if (!dc_ok(dct[k].i, dct[k].q) || (k && dct[k].fkhz <= dct[k - 1].fkhz)) dct_n = 0;     /* damaged: ignore it */
+    }
     nvs_close(h);
 }
 
-static bool beacon_dc_store(bool erase) {
+/* The correction for fkhz: by hand, else the table, else the single value. *src: "hand", "table", "saved", "built-in". */
+static void dc_for(uint32_t fkhz, float *i, float *q, const char **src) {
+    if (dc_by_hand) { *i = dc_hand[0]; *q = dc_hand[1]; *src = "hand"; return; }
+    if (!dct_n) { *i = beacon_dc[0]; *q = beacon_dc[1]; *src = beacon_dc_saved ? "saved" : "built-in"; return; }
+    *src = "table";
+    uint32_t k = 0;
+    while (k < dct_n && dct[k].fkhz < fkhz) ++k;
+    if (k == 0 || k == dct_n) { const dct_entry_t *e = &dct[k ? k - 1 : 0]; *i = e->i; *q = e->q; return; }
+    const dct_entry_t *a = &dct[k - 1], *b = &dct[k];
+    const float t = (float)(fkhz - a->fkhz) / (float)(b->fkhz - a->fkhz);
+    *i = a->i + t * (b->i - a->i);
+    *q = a->q + t * (b->q - a->q);
+}
+
+static bool dct_store(void) {
     nvs_handle_t h;
     if (nvs_open("beacon", NVS_READWRITE, &h) != ESP_OK) return false;
-    const esp_err_t e = erase ? nvs_erase_key(h, "dc") : nvs_set_blob(h, "dc", beacon_dc, sizeof(beacon_dc));
-    const bool ok = (e == ESP_OK || (erase && e == ESP_ERR_NVS_NOT_FOUND)) && nvs_commit(h) == ESP_OK;
+    const esp_err_t e = dct_n ? nvs_set_blob(h, "dct", dct, dct_n * sizeof(dct_entry_t)) : nvs_erase_key(h, "dct");
+    const bool ok = (e == ESP_OK || (!dct_n && e == ESP_ERR_NVS_NOT_FOUND)) && nvs_commit(h) == ESP_OK;
     nvs_close(h);
     return ok;
 }
 
-static void beacon_dc_say(void) {
-    say("BDC %.3f %.3f (%s)\r\n", (double)beacon_dc[0], (double)beacon_dc[1], beacon_dc_saved ? "saved" : "built-in");
+/* BDC SAVE: i q for fkhz into the table (replaces an entry within 50 kHz; the table full: refused). */
+static bool dct_put(uint32_t fkhz, float i, float q) {
+    uint32_t k = 0;
+    while (k < dct_n && dct[k].fkhz + 50u < fkhz) ++k;
+    if (k < dct_n && dct[k].fkhz <= fkhz + 50u) {
+        dct[k].fkhz = fkhz;
+    } else {
+        if (dct_n == DCT_MAX) return false;
+        memmove(&dct[k + 1], &dct[k], (dct_n - k) * sizeof(dct_entry_t));
+        ++dct_n;
+        dct[k].fkhz = fkhz;
+    }
+    dct[k].i = i;
+    dct[k].q = q;
+    return dct_store();
+}
+
+static bool dc_reset(void) {                    /* BDC RESET: the table and the single value gone, the built-in value again */
+    dct_n = 0;
+    bool ok = dct_store();
+    nvs_handle_t h;
+    if (nvs_open("beacon", NVS_READWRITE, &h) == ESP_OK) {
+        const esp_err_t e = nvs_erase_key(h, "dc");
+        ok = ok && (e == ESP_OK || e == ESP_ERR_NVS_NOT_FOUND) && nvs_commit(h) == ESP_OK;
+        nvs_close(h);
+    } else {
+        ok = false;
+    }
+    beacon_dc[0] = BEACON_DC_I;
+    beacon_dc[1] = BEACON_DC_Q;
+    beacon_dc_saved = false;
+    dc_by_hand = false;
+    return ok;
 }
 
 /* Front panel: the settings (panel_cfg) choose frequency, level, symbol rate (8 MS/s / S, any S >= 16), PA, pilots, service name and
@@ -1088,7 +1160,7 @@ static void beacon_dc_say(void) {
  * The loop runs in chunks of half the loop length: between two chunks (with interrupts still off) the GPIO interrupt status tells whether a
  * panel pin moved. The next chunk starts at the exact time the next symbol is due (the same schedule as within a chunk), so a boundary only
  * costs the tail of one symbol and the filter history of the next few; both boundaries lie in the LDPC parity of a frame.
- * Returns 3: a byte from the host, 4: panel input, 0: could not start (the reason is on the screen). */
+ * Returns 3: a byte from the host, 4: panel input, 5: BDC TEST's time is up, 0: could not start (the reason is on the screen). */
 /* Stand-alone video (host/make_video.py, written to the "video" partition): a valid header makes the beacon play it instead of the test
  * card. 1.7 MB do not fit the RAM, and reading them through the flash cache stalls the loop (a miss costs about 320 cycles, 16 DAC
  * samples), so lutf.S (gen_lutg.py --flash) takes them from a 512 byte RAM ring that SPI1 fills in the background: every 16 symbols
@@ -1219,13 +1291,45 @@ static int beacon_fail(const char *msg, void *a, void *b, void *c) {
     return 0;
 }
 
+/* The beacon's frequency: a version 3 loop carries its own (set on the phone with it); else the panel's. */
+static uint32_t beacon_fkhz(const video_hdr_t *v) {
+    return v && v->version >= 3u && v->freq_khz >= TX_FMIN_KHZ && v->freq_khz <= TX_FMAX_KHZ ? v->freq_khz : panel_cfg.fkhz;
+}
+
+/* The frequency the DC correction is for now: BDC TEST's, else the beacon's. */
+static uint32_t dc_fkhz(void) {
+    if (dc_test && dc_test_fkhz) return dc_test_fkhz;
+    return beacon_fkhz(panel_cfg.video ? video_find() : NULL);
+}
+
+static void dc_say(uint32_t fkhz) {
+    float i, q;
+    const char *src;
+    dc_for(fkhz, &i, &q, &src);
+    say("BDC %.3f %.3f (%s) F %lu TEST %u\r\n", (double)i, (double)q, src, (unsigned long)fkhz, (unsigned)dc_test);
+}
+
+/* BDC TEST: group 0 of the table holds only the DC correction, every other entry 0 (amp 0). The 10-bit DAC fields take whole codes,
+ * so the fraction is spread over the S samples of a symbol by error feedback: its mean is exact to 1 / S code, the rest are lines at
+ * multiples of the symbol rate, far from the leakage tone. */
+static void dc_test_table(int32_t *T, uint32_t S, float dci, float dcq) {
+    float ei = 0.0f, eq = 0.0f;
+    for (uint32_t j = 0; j < S; ++j) {
+        const int32_t ri = (int32_t)lroundf(dci + ei), rq = (int32_t)lroundf(dcq + eq);
+        ei += dci - (float)ri;
+        eq += dcq - (float)rq;
+        for (uint32_t idx = 0; idx < 16u; ++idx) T[j * 16u + idx] = ri + (rq << 10);
+    }
+}
+
 static int beacon_run(void) {
     const panel_cfg_t *p = &panel_cfg;
-    const video_hdr_t *v = p->video ? video_find() : NULL;          /* the panel's source; the test card when there is no video */
+    const bool test = dc_test;
+    const video_hdr_t *v = !test && p->video ? video_find() : NULL;  /* the panel's source; the test card when there is no video */
 #if !CONFIG_DATV_BUILTIN_BEACON
-    if (!v) return beacon_fail("no loop", NULL, NULL, NULL);       /* web build: nothing without the operator's loop (VIDW) */
+    if (!v && !test) return beacon_fail("no loop", NULL, NULL, NULL);   /* web build: nothing without the operator's loop (VIDW) */
 #endif
-    const uint32_t baud = v ? v->baud : panel_sr_baud[p->sr], period = 20, S = v ? video_s(baud) : CPU_HZ / baud / period;
+    const uint32_t baud = test ? DC_TEST_BAUD : v ? v->baud : panel_sr_baud[p->sr], period = 20, S = v ? video_s(baud) : CPU_HZ / baud / period;
     uint8_t *loop;
     uint32_t nsym, chunk;
     lutf_ctx_t fx;
@@ -1237,6 +1341,11 @@ static int beacon_run(void) {
         if (!loop) return beacon_fail("no memory", NULL, NULL, NULL);
         nsym = v->nsym;
         chunk = 4u * video_frame_syms(v);                            /* 4 PLFRAMEs: the boundaries stay in the LDPC parity */
+    } else if (test) {                                               /* any symbols: amp 0 */
+        nsym = DC_TEST_SYMBOLS;
+        loop = calloc(nsym / 4u, 1);
+        if (!loop) return beacon_fail("no memory", NULL, NULL, NULL);
+        chunk = nsym / 2;
     } else {
         const bool builtin = p->pilots == BEACON_PILOTS && !strcmp(p->service, BEACON_SERVICE) && !strcmp(p->provider, BEACON_PROVIDER);
         const size_t bytes = (size_t)(beacon_bin_end - beacon_bin_start);
@@ -1253,9 +1362,13 @@ static int beacon_run(void) {
     if (!T || !hb) return beacon_fail("no memory", loop, T, hb);
     /* a version 3 loop carries its own frequency and level (set on the phone with it); else the panel's */
     const bool own = v && v->version >= 3u;
-    const uint32_t fkhz = own && v->freq_khz >= TX_FMIN_KHZ && v->freq_khz <= TX_FMAX_KHZ ? v->freq_khz : p->fkhz;
-    const float amp = own && v->amp >= 1u && v->amp <= 480u ? (float)v->amp : (float)panel_amp();
-    lut_build_t(T, S, 0, 0.35f, amp, beacon_dc[0], beacon_dc[1], BEACON_IQ_GAIN, BEACON_IQ_PHASE, hb);
+    const uint32_t fkhz = test && dc_test_fkhz ? dc_test_fkhz : beacon_fkhz(v);
+    const float amp = test ? 0.0f : own && v->amp >= 1u && v->amp <= 480u ? (float)v->amp : (float)panel_amp();
+    float dci, dcq;
+    const char *src;
+    dc_for(fkhz, &dci, &dcq, &src);
+    lut_build_t(T, S, 0, 0.35f, amp, test ? 0.0f : dci, test ? 0.0f : dcq, BEACON_IQ_GAIN, BEACON_IQ_PHASE, hb);
+    if (test) dc_test_table(T, S, dci, dcq);
     free(hb);
     if (!tune(fkhz)) return beacon_fail("frequency", loop, T, NULL);
     const sample_clock_t symbol_clock = sample_clock_init(CPU_HZ, baud);
@@ -1292,10 +1405,24 @@ static int beacon_run(void) {
     }
     const uint64_t carry = (uint64_t)chunk * c->rem;                /* a chunk lasts chunk * sper + (phase + carry) / div cycles */
     const uint32_t chunk_cyc = chunk * c->sper + (uint32_t)(carry / c->div), chunk_rem = (uint32_t)(carry % c->div);
+    /* BDC TEST: the chunks left until its time is up (a chunk lasts chunk_cyc CPU cycles) */
+    const int64_t left_us = test ? dc_test_until - esp_timer_get_time() : 0;
+    const uint64_t test_chunks = left_us > 0 ? (uint64_t)left_us * (CPU_HZ / 1000000u) / chunk_cyc : 0;
+    if (test && !test_chunks) {
+        free(T);
+        free(loop);
+        return 5;
+    }
     panel_error(NULL);
+    const bool pa = p->pa && !test;
+    if (test) {
+        char fl[24];
+        snprintf(fl, sizeof(fl), "BDC %.2f %.2f", (double)dci, (double)dcq);
+        panel_show("DC TEST", false, fkhz, "LO leakage only", fl, "BDC TEST off", NULL);
+    }
     const uint32_t owner0 = rd(SRAM_OWNER);
-    pa_set(p->pa);
-    if (p->pa) esp_rom_delay_us(5000);
+    pa_set(pa);
+    if (pa) esp_rom_delay_us(5000);
     phy_txforce(1);
     esp_rom_delay_us(3000);
     DAC_BUF[0] = 0;
@@ -1318,6 +1445,7 @@ static int beacon_run(void) {
         ++chunks;
         if (c->exitc == 3) { why = 3; break; }                       /* a byte from the host */
         if (panel_latched()) { why = 4; break; }
+        if (test && chunks >= test_chunks) { why = 5; break; }       /* BDC TEST: time is up */
         c->tn = c->trx = tn + chunk_cyc + (ph + chunk_rem >= c->div ? 1u : 0u);
     }
     const uint32_t late = c->late;
@@ -1331,7 +1459,7 @@ static int beacon_run(void) {
     tx_leave();
     free(T);
     free(loop);
-    say("BEACON END %s late %lu chunks %lu\r\n", why == 3 ? "host" : "panel", (unsigned long)late, (unsigned long)chunks);
+    say("BEACON END %s late %lu chunks %lu\r\n", why == 3 ? "host" : why == 5 ? "test timeout" : "panel", (unsigned long)late, (unsigned long)chunks);
     return why;
 }
 
@@ -1471,31 +1599,74 @@ static void handle(char *line) {
     } else if (!strncmp(line, "VIDW ", 5)) {
         vidw(line + 5);
     } else if (!strncmp(line, "BDC", 3) && (line[3] == 0 || line[3] == ' ')) {
-        /* BDC: show; BDC i q: set the DC correction [DAC codes] and restart the beacon; BDC SAVE / BDC RESET: keep it in NVS /
-         * go back to the built-in values. A beacon command: the beacon keeps (or starts) running. */
+        /* BDC / BDC GET [f_MHz]: show (for f_MHz: the value the table gives there); BDC i q: set the DC correction [DAC codes] by
+         * hand and restart the beacon; BDC SAVE: the current value into the table at the current frequency; BDC LIST: the table;
+         * BDC RESET: the table gone, the built-in value; BDC TEST on [f_MHz] | off: the leakage alone (see beacon_dc above).
+         * A beacon command: the beacon keeps (or starts) running. */
         host_seen = false;
         const char *arg = line + 3;
         while (*arg == ' ') ++arg;
-        if (!strcmp(arg, "SAVE")) {
-            if (beacon_dc_store(false)) beacon_dc_saved = true;
-            else say("ERR BDC SAVE\r\n");
+        if (dc_test) dc_test_until = esp_timer_get_time() + DCT_TEST_US;    /* every BDC command keeps the test alive */
+        if (!strncmp(arg, "GET", 3) && (arg[3] == 0 || arg[3] == ' ')) {
+            const char *f = arg + 3;
+            while (*f == ' ') ++f;
+            char *e;
+            const double mhz = *f ? strtod(f, &e) : 0.0;
+            if (*f && (e == f || *e || mhz < TX_FMIN_KHZ / 1000.0 || mhz > TX_FMAX_KHZ / 1000.0)) {
+                say("ERR BDC GET [f_MHz 2300..2450]\r\n");
+                return;
+            }
+            dc_say(*f ? (uint32_t)llround(mhz * 1000.0) : dc_fkhz());
+            return;                                                  /* nothing changed: no restart */
+        }
+        if (!strcmp(arg, "LIST")) {
+            say("BDCT %lu\r\n", (unsigned long)dct_n);
+            for (uint32_t k = 0; k < dct_n; ++k)
+                say("BDCT %lu %.3f %.3f\r\n", (unsigned long)dct[k].fkhz, (double)dct[k].i, (double)dct[k].q);
+            return;
+        }
+        if (!strncmp(arg, "TEST", 4) && (arg[4] == 0 || arg[4] == ' ')) {
+            const char *t = arg + 4;
+            while (*t == ' ') ++t;
+            if (!strcmp(t, "off")) {
+                dc_test = false;
+            } else if (!strncmp(t, "on", 2) && (t[2] == 0 || t[2] == ' ')) {
+                const char *f = t + 2;
+                while (*f == ' ') ++f;
+                char *e;
+                const double mhz = *f ? strtod(f, &e) : 0.0;
+                if (*f && (e == f || *e || mhz < TX_FMIN_KHZ / 1000.0 || mhz > TX_FMAX_KHZ / 1000.0)) {
+                    say("ERR BDC TEST on [f_MHz 2300..2450] | off\r\n");
+                    return;
+                }
+                dc_test = true;
+                dc_test_fkhz = *f ? (uint32_t)llround(mhz * 1000.0) : 0;
+                dc_test_until = esp_timer_get_time() + DCT_TEST_US;
+            } else {
+                say("ERR BDC TEST on [f_MHz 2300..2450] | off\r\n");
+                return;
+            }
+        } else if (!strcmp(arg, "SAVE")) {
+            float i, q;
+            const char *src;
+            const uint32_t f = dc_fkhz();
+            dc_for(f, &i, &q, &src);
+            if (dct_put(f, i, q)) dc_by_hand = false;
+            else say("ERR BDC SAVE%s\r\n", dct_n == DCT_MAX ? " (table full: BDC RESET)" : "");
         } else if (!strcmp(arg, "RESET")) {
-            if (!beacon_dc_store(true)) say("ERR BDC RESET\r\n");
-            beacon_dc[0] = BEACON_DC_I;
-            beacon_dc[1] = BEACON_DC_Q;
-            beacon_dc_saved = false;
+            if (!dc_reset()) say("ERR BDC RESET\r\n");
         } else if (*arg) {
             char *e1, *e2;
             const float i = strtof(arg, &e1), q = strtof(e1, &e2);
-            if (e1 == arg || e2 == e1 || *e2 || fabsf(i) > 512.0f || fabsf(q) > 512.0f) {
-                say("ERR BDC i q (DAC codes, -512..512) | SAVE | RESET\r\n");
+            if (e1 == arg || e2 == e1 || *e2 || !dc_ok(i, q)) {
+                say("ERR BDC i q (DAC codes, -512..512) | GET [f_MHz] | SAVE | LIST | RESET | TEST on [f_MHz] | off\r\n");
                 return;
             }
-            beacon_dc[0] = i;
-            beacon_dc[1] = q;
-            beacon_dc_saved = false;
+            dc_hand[0] = i;
+            dc_hand[1] = q;
+            dc_by_hand = true;
         }
-        beacon_dc_say();
+        dc_say(dc_fkhz());
         beacon_restart = true;
     } else {
         host_seen = seen;                                            /* e.g. a modem probe: does not stop the beacon for good */
@@ -1552,6 +1723,11 @@ void app_main(void) {
                 panel_show("STANDBY", false, 0, "PC on USB", NULL, "Any key: local", NULL);
             } else if (why == 4) {
                 panel_wake();
+            } else if (why == 5) {               /* BDC TEST forgotten: off, as after INFO, until a command or a reset */
+                dc_test = false;
+                host_seen = true;
+                say("BDC TEST timeout: TX off\r\n");
+                panel_show("STANDBY", false, 0, "BDC TEST timeout", NULL, "Any key: local", NULL);
             } else {
                 failed = true;
             }
