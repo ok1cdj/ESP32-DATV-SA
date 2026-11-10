@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
+#pragma GCC diagnostic ignored "-Wunused-function"          /* the SSB part of the header */
 #include "../firmware/main/cw_lut.h"
 
 #define CW_FS 2000000.0
