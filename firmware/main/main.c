@@ -17,6 +17,7 @@
  *   QPSKT f_MHz baud sps [amp [seconds [ifm [target [dcI dcQ [g phi]]]]]]   see qpsk_lut.h and README.md
  *   PSK8T ...same arguments   8PSK from the generic loop (3 bit symbols, 16..64 samples per symbol at 8 MS/s)
  *   CW [INFO | ON | OFF | SET key value | SAVE | DEFAULTS]   CW beacon: NCO carrier keyed with Morse text, then a long carrier
+ *   SSB ON   USB from the host: int16 I, Q at 62.5 kS/s after the OK line, at the CW beacon's F, NCO, AMP, PA (see ssb_run)
  *   BDC [GET [f_MHz] | i q | SAVE | PUT f_MHz i q | LIST | RESET | TEST on [f_MHz] | off]   beacon DC correction [DAC codes]
  *                              against the carrier leakage: show / set by hand and restart the beacon / keep for the current frequency
  *                              in the NVS table / put an entry into it / list it / back to the built-in values of beacon_cfg.h /
@@ -1778,6 +1779,135 @@ static void cw_command(const char *arg) {
     }
 }
 
+/* ------------------------------------------------------------ SSB from the host (cw_lut.h)
+ * SSB ON: the host streams the analytic signal (USB: spectrum above 0 Hz) as int16 I, Q pairs (little endian) at
+ * SSB_IN_RATE; the loop interpolates it linearly to CW_FS, applies AMP, rotates it by the NCO to the CW beacon's frequency F
+ * (LO = F - NCO, the DC and I/Q corrections of the beacon) and writes the DAC, from the same kind of C loop as the CW beacon.
+ * Only the bytes are read in the loop (slots 2, 6, 10, 14 of a block: up to 4 bytes a block, twice what the stream needs); a
+ * fill report (0xB7, fill in pairs, 2 bytes, underruns, 1 byte) goes to the host every SSB_REPORT blocks so that it can pace
+ * itself. The transmitter goes off when the host is silent for SSB_SILENCE_US (3 s before the first byte), the PTT of the host:
+ * it stops sending. Underruns send silence (the carrier stays suppressed). */
+#define SSB_IN_RATE    (CW_FS / SSB_INTERP)  /* 62500 pairs per second */
+#define SSB_RING       32768u                /* bytes: 8192 pairs = 131 ms */
+#define SSB_REPORT     512u                  /* blocks between fill reports (4 ms) */
+#define SSB_SILENCE_US 500000u
+_Static_assert(SSB_INTERP == 2u * CW_BLOCK, "an input pair every two blocks");
+
+typedef struct {
+    uint8_t *ring;
+    const int16_t *c, *s, *sp, *cp;
+    int32_t di[CW_BLOCK], dq[CW_BLOCK];
+    uint32_t inc, amp;
+    uint32_t qw, qr, under, late, blocks, pairs;
+} ssb_ctx_t;
+
+static int __attribute__((noinline)) ssb_loop(ssb_ctx_t *c) {
+    const int16_t *const tc = c->c, *const ts = c->s, *const tsp = c->sp, *const tcp = c->cp;
+    uint8_t *const ring = c->ring;
+    const uint32_t inc = c->inc, amp = c->amp, period = CPU_HZ / CW_FS;
+    uint32_t qw = 0, qr = 0, under = 0, late = 0, blocks = 0, pairs = 0, phase = 0, qw_seen = 0;
+    int32_t u = 0, v = 0, du = 0, dv = 0;
+    uint32_t word = ssb_word(0, 0, 0, tc, ts, tsp, tcp, c->di[0], c->dq[0]), tn = ccount() + 20000u, t_rx = tn;
+    uint32_t limit = 3u * CPU_HZ;                                    /* before the first byte */
+    for (;;) {
+        for (uint32_t j = 0; j < CW_BLOCK; ++j) {
+            uint32_t now;
+            do { now = ccount(); } while ((int32_t)(now - tn) < 0);
+            DAC_BUF[0] = word;
+            late += now - tn > 8u;
+            tn += period;
+            if ((j & 3u) == 2u && qw - qr < SSB_RING - 1u && USB_SERIAL_JTAG.ep1_conf.serial_out_ep_data_avail)
+                ring[qw++ & (SSB_RING - 1u)] = (uint8_t)USB_SERIAL_JTAG.ep1.val;
+            u += du;
+            v += dv;
+            phase += inc;
+            word = ssb_word(u, v, phase, tc, ts, tsp, tcp, c->di[(j + 1u) & (CW_BLOCK - 1u)], c->dq[(j + 1u) & (CW_BLOCK - 1u)]);
+        }
+        ++blocks;
+        if (!(blocks & 1u)) {                                        /* the next input pair: the steps to it over SSB_INTERP samples */
+            int32_t ti = 0, tq = 0;
+            if (qw - qr >= 4u) {
+                const uint32_t m = SSB_RING - 1u;
+                ti = (int16_t)(ring[qr & m] | ring[(qr + 1u) & m] << 8);
+                tq = (int16_t)(ring[(qr + 2u) & m] | ring[(qr + 3u) & m] << 8);
+                qr += 4u;
+                ++pairs;
+            } else if (qw) {
+                ++under;
+            }
+            du = (ti * (int32_t)amp - u) / (int32_t)SSB_INTERP;
+            dv = (tq * (int32_t)amp - v) / (int32_t)SSB_INTERP;
+        }
+        if (!(blocks & (SSB_REPORT - 1u)) && USB_SERIAL_JTAG.ep1_conf.serial_in_ep_data_free) {
+            const uint32_t fill = (qw - qr) / 4u;
+            USB_SERIAL_JTAG.ep1.val = 0xB7;
+            USB_SERIAL_JTAG.ep1.val = fill & 255u;
+            USB_SERIAL_JTAG.ep1.val = fill >> 8;
+            USB_SERIAL_JTAG.ep1.val = under > 255u ? 255u : under;
+            usb_serial_jtag_ll_txfifo_flush();
+        }
+        if (!(blocks & 63u)) {                                       /* silence: the host's PTT is off */
+            const uint32_t t = ccount();
+            if (qw != qw_seen) { qw_seen = qw; t_rx = t; limit = SSB_SILENCE_US * (CPU_HZ / 1000000u); }
+            else if (t - t_rx > limit) break;
+        }
+    }
+    c->qw = qw; c->qr = qr; c->under = under; c->late = late; c->blocks = blocks; c->pairs = pairs;
+    return 0;
+}
+
+/* SSB ON: the CW beacon's F, NCO, AMP and PA; the stream follows the OK line at once. */
+static void ssb_run(void) {
+    const cw_cfg_t cfg = cw_cfg;
+    const uint32_t lo_khz = cw_lo_khz(&cfg);
+    if (!lo_khz) { say("ERR SSB frequency: carrier and LO within %u..%u MHz\r\n", TX_FMIN_KHZ / 1000u, TX_FMAX_KHZ / 1000u); return; }
+    float dci, dcq;
+    const char *src;
+    dc_for(lo_khz, &dci, &dcq, &src);
+    if (cfg.amp + fmaxf(fabsf(dci), fabsf(dcq)) > 510.0f) { say("ERR SSB AMP + DC over 510\r\n"); return; }
+    uint8_t *ring = malloc(SSB_RING);
+    int16_t *tabs = malloc(4u * SSB_SIN_N * sizeof(int16_t));
+    if (!ring || !tabs) { free(ring); free(tabs); say("ERR SSB no memory\r\n"); return; }
+    ssb_ctx_t c = {.ring = ring, .c = tabs, .s = tabs + SSB_SIN_N, .sp = tabs + 2u * SSB_SIN_N, .cp = tabs + 3u * SSB_SIN_N, .amp = cfg.amp};
+    ssb_tables(tabs, tabs + SSB_SIN_N, tabs + 2u * SSB_SIN_N, tabs + 3u * SSB_SIN_N, BEACON_IQ_GAIN, BEACON_IQ_PHASE);
+    cw_dc_pattern(c.di, dci);
+    cw_dc_pattern(c.dq, dcq);
+    if (!tune(lo_khz)) { free(ring); free(tabs); say("ERR SSB TUNE\r\n"); return; }
+    const double nco = cfg.fhz - lo_hz;
+    c.inc = (uint32_t)(int32_t)llround(nco / CW_FS * 4294967296.0);
+    panel_show("SSB (USB)", cfg.pa, cfg.fhz / 1000u, "stream from PC", NULL, NULL, NULL);
+    const uint32_t owner0 = rd(SRAM_OWNER);
+    pa_set(cfg.pa);
+    if (cfg.pa) esp_rom_delay_us(5000);
+    phy_txforce(1);
+    esp_rom_delay_us(3000);
+    DAC_BUF[0] = 0;
+    usb_drain_rx();
+    say("OK SSB LO %.0f NCO %.3f F %.3f AMP %u RATE %u RING %u DC %.2f %.2f (%s) PA %u\r\n", lo_hz,
+        (double)(int32_t)c.inc * CW_FS / 4294967296.0, lo_hz + (double)(int32_t)c.inc * CW_FS / 4294967296.0, (unsigned)cfg.amp,
+        (unsigned)SSB_IN_RATE, (unsigned)(SSB_RING / 4u), (double)dci, (double)dcq, src, (unsigned)cfg.pa);
+    taskENTER_CRITICAL(&stream_mux);
+    wr(SRAM_OWNER, (owner0 & ~7u) | 2u | 8u);
+    __asm__ volatile("fence rw,rw" ::: "memory");
+    wr(DAC_CTRL, rd(DAC_CTRL) & ~(1u << 31));
+    wr(DAC_CTRL, 0x80000u | 1u);
+    wr(DAC_CTRL, 0x80000u | 1u | (1u << 31));
+    ssb_loop(&c);
+    DAC_BUF[0] = 0;
+    wr(DAC_CTRL, rd(DAC_CTRL) & ~(1u << 31));
+    wr(SRAM_OWNER, owner0);
+    taskEXIT_CRITICAL(&stream_mux);
+    phy_txforce(0);
+    pa_set(false);
+    tx_leave();
+    free(tabs);
+    free(ring);
+    vTaskDelay(pdMS_TO_TICKS(30));
+    usb_drain_rx();
+    say("SSB END pairs %lu underruns %lu late %lu of %lu samples\r\n", (unsigned long)c.pairs, (unsigned long)c.under,
+        (unsigned long)c.late, (unsigned long)(c.blocks * CW_BLOCK));
+}
+
 /* ------------------------------------------------------------ VIDW: writing the video partition from USB (this fork)
  * VIDW BEGIN bytes crc32   erase what the file needs (4 KB sectors); OK VIDW BEGIN bytes
  * VIDW DATA offset n crc32 then exactly n raw bytes (n <= 4096); written at offset; OK VIDW DATA offset
@@ -1914,6 +2044,9 @@ static void handle(char *line) {
         panel_show("STANDBY", false, fk, mod, sr, "PC on USB", "Any key: local");
     } else if (!strncmp(line, "CW", 2) && (line[2] == 0 || line[2] == ' ')) {
         cw_command(line + 2);
+    } else if (!strcmp(line, "SSB ON")) {
+        cw_on = false;                                               /* the beacon stays off afterwards (host_seen is set) */
+        ssb_run();
     } else if (!strncmp(line, "VIDW ", 5)) {
         vidw(line + 5);
     } else if (!strncmp(line, "BDC", 3) && (line[3] == 0 || line[3] == ' ')) {
@@ -2005,7 +2138,7 @@ static void handle(char *line) {
         host_seen = seen;                                            /* e.g. a modem probe: does not stop the beacon for good */
         pa_requested = false;
         pa_set(false);
-        say("ERR ? (commands: INFO, HEAP, PA, BDC, CW, VIDW, QPSKT, PSK8T, A16T, A32T)\r\n");
+        say("ERR ? (commands: INFO, HEAP, PA, BDC, CW, SSB, VIDW, QPSKT, PSK8T, A16T, A32T)\r\n");
     }
 }
 
