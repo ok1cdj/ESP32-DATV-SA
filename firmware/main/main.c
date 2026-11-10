@@ -1783,15 +1783,14 @@ static void cw_command(const char *arg) {
  * SSB ON: the host streams the analytic signal (USB: spectrum above 0 Hz) as int16 I, Q pairs (little endian) at
  * SSB_IN_RATE; the loop interpolates it linearly to SSB_FS, applies AMP, rotates it by the NCO to the CW beacon's frequency F
  * (LO = F - NCO, the DC and I/Q corrections of the beacon) and writes the DAC, from the same kind of C loop as the CW beacon.
- * The bytes are read at the start of each block (up to 4, twice what the stream needs); a
- * fill report (0xB7, fill in pairs, 2 bytes, underruns, 1 byte) goes to the host every SSB_REPORT blocks so that it can pace
+ * The work is spread over the samples of an input pair (see ssb_loop); a
+ * fill report (0xB7, fill in pairs, 2 bytes, underruns, 1 byte) goes to the host every 2.6 ms so that it can pace
  * itself. The transmitter goes off when the host is silent for SSB_SILENCE_US (3 s before the first byte), the PTT of the host:
  * it stops sending. Underruns send silence (the carrier stays suppressed). */
 #define SSB_FS         1600000u              /* DAC samples per second: 100 CPU cycles a sample (2 MS/s left too little room:
                                                 each block's USB read and input pair made late samples, lines at +-62.5 kHz) */
 #define SSB_IN_RATE    (SSB_FS / SSB_INTERP) /* 50000 pairs per second */
 #define SSB_RING       32768u                /* bytes: 8192 pairs = 164 ms */
-#define SSB_REPORT     512u                  /* blocks between fill reports (4 ms) */
 #define SSB_SILENCE_US 500000u
 _Static_assert(SSB_INTERP == 2u * CW_BLOCK, "an input pair every two blocks");
 _Static_assert(CPU_HZ % SSB_FS == 0, "SSB_FS must divide the CPU clock");
@@ -1804,60 +1803,70 @@ typedef struct {
     uint32_t qw, qr, under, late, blocks, pairs;
 } ssb_ctx_t;
 
-/* Few live values in the sample loop (RV32 has to keep them in registers): one table pointer, one DC pointer, and the USB bytes
- * read once a block, up to 4 (the stream needs 2), so that the first sample of a block may come late and the others catch up. */
+/* The loop covers one input pair (SSB_INTERP samples), unrolled, and every piece of work has a fixed sample of its own, so that
+ * no sample is much later than the others: a late sample every block or pair made lines at +-50 kHz (-28 .. -44 dBc on the
+ * bench). Per pair: a USB byte may be read every 4th sample (8 a pair, the stream needs 4); the next pair is taken from the ring
+ * at sample 6 and its steps are worked out at sample 14 from where u, v will be at the end of this pair, so that the pair
+ * boundary only copies them; the fill report goes out a byte a sample (20 .. 30, every SSB_REPORT_PAIRS pairs); the silence
+ * check is at sample 2. */
+#define SSB_REPORT_PAIRS 128u                /* pairs between fill reports (2.6 ms) */
 static int __attribute__((noinline)) ssb_loop(ssb_ctx_t *c) {
     const ssb_tab_t *const tab = c->tab;
     uint8_t *const ring = c->ring;
+    const int16_t (*const dc)[2] = c->dc;
     const uint32_t inc = c->inc, amp = c->amp, period = CPU_HZ / SSB_FS, m = SSB_RING - 1u;
-    uint32_t qw = 0, qr = 0, under = 0, late = 0, blocks = 0, pairs = 0, phase = 0, qw_seen = 0;
-    int32_t u = 0, v = 0, du = 0, dv = 0;
-    uint32_t word = ssb_word(0, 0, 0, tab, c->dc[0]), tn = ccount() + 20000u, t_rx = tn;
+    uint32_t qw = 0, qr = 0, under = 0, late = 0, cycles = 0, pairs = 0, phase = 0, qw_seen = 0, rep = 0;
+    bool reporting = false;
+    int32_t u = 0, v = 0, du = 0, dv = 0, ndu = 0, ndv = 0, ti = 0, tq = 0;
+    uint32_t word = ssb_word(0, 0, 0, tab, dc[0]), tn = ccount() + 20000u, t_rx = tn;
     uint32_t limit = 3u * CPU_HZ;                                    /* before the first byte */
     for (;;) {
-        for (uint32_t n = 0; n < 4u && qw - qr < m && USB_SERIAL_JTAG.ep1_conf.serial_out_ep_data_avail; ++n)
-            ring[qw++ & m] = (uint8_t)USB_SERIAL_JTAG.ep1.val;
-        const int16_t (*dc)[2] = c->dc;
-        for (uint32_t j = 0; j < CW_BLOCK; ++j) {
+#pragma GCC unroll 32
+        for (uint32_t j = 0; j < SSB_INTERP; ++j) {
             uint32_t now;
             do { now = ccount(); } while ((int32_t)(now - tn) < 0);
             DAC_BUF[0] = word;
             late += now - tn > 8u;
             tn += period;
+            if (j == 0) { du = ndu; dv = ndv; }
             u += du;
             v += dv;
             phase += inc;
+            if ((j & 3u) == 1u) {
+                if (qw - qr < m && USB_SERIAL_JTAG.ep1_conf.serial_out_ep_data_avail) ring[qw++ & m] = (uint8_t)USB_SERIAL_JTAG.ep1.val;
+            } else if (j == 2u) {
+                if (!(cycles & 63u)) {                               /* silence: the host's PTT is off */
+                    const uint32_t t = ccount();
+                    if (qw != qw_seen) { qw_seen = qw; t_rx = t; limit = SSB_SILENCE_US * (CPU_HZ / 1000000u); }
+                    else if (t - t_rx > limit) goto out;
+                }
+            } else if (j == 6u) {                                    /* the next pair */
+                if (qw - qr >= 4u) {
+                    ti = (int16_t)(ring[qr & m] | ring[(qr + 1u) & m] << 8);
+                    tq = (int16_t)(ring[(qr + 2u) & m] | ring[(qr + 3u) & m] << 8);
+                    qr += 4u;
+                    ++pairs;
+                } else {
+                    ti = tq = 0;
+                    under += qw != 0;
+                }
+            } else if (j == 14u) {                                   /* its steps, from where u, v end this pair */
+                ndu = (ti * (int32_t)amp - (u + du * (int32_t)(SSB_INTERP - 1u - j))) / (int32_t)SSB_INTERP;
+                ndv = (tq * (int32_t)amp - (v + dv * (int32_t)(SSB_INTERP - 1u - j))) / (int32_t)SSB_INTERP;
+            } else if (j == 20u) {
+                reporting = !(cycles & (SSB_REPORT_PAIRS - 1u)) && USB_SERIAL_JTAG.ep1_conf.serial_in_ep_data_free;
+                if (reporting) { const uint32_t fill = (qw - qr) / 4u; rep = 0xB7u | (fill & 0xFFFFu) << 8 | (under > 255u ? 255u : under) << 24; }
+            } else if (j == 22u || j == 24u || j == 26u || j == 28u) {
+                if (reporting) { USB_SERIAL_JTAG.ep1.val = rep & 255u; rep >>= 8; }
+            } else if (j == 30u) {
+                if (reporting) usb_serial_jtag_ll_txfifo_flush();
+            }
             word = ssb_word(u, v, phase, tab, dc[(j + 1u) & (CW_BLOCK - 1u)]);
         }
-        ++blocks;
-        if (!(blocks & 1u)) {                                        /* the next input pair: the steps to it over SSB_INTERP samples */
-            int32_t ti = 0, tq = 0;
-            if (qw - qr >= 4u) {
-                ti = (int16_t)(ring[qr & m] | ring[(qr + 1u) & m] << 8);
-                tq = (int16_t)(ring[(qr + 2u) & m] | ring[(qr + 3u) & m] << 8);
-                qr += 4u;
-                ++pairs;
-            } else if (qw) {
-                ++under;
-            }
-            du = (ti * (int32_t)amp - u) / (int32_t)SSB_INTERP;
-            dv = (tq * (int32_t)amp - v) / (int32_t)SSB_INTERP;
-        }
-        if (!(blocks & (SSB_REPORT - 1u)) && USB_SERIAL_JTAG.ep1_conf.serial_in_ep_data_free) {
-            const uint32_t fill = (qw - qr) / 4u;
-            USB_SERIAL_JTAG.ep1.val = 0xB7;
-            USB_SERIAL_JTAG.ep1.val = fill & 255u;
-            USB_SERIAL_JTAG.ep1.val = fill >> 8;
-            USB_SERIAL_JTAG.ep1.val = under > 255u ? 255u : under;
-            usb_serial_jtag_ll_txfifo_flush();
-        }
-        if (!(blocks & 63u)) {                                       /* silence: the host's PTT is off */
-            const uint32_t t = ccount();
-            if (qw != qw_seen) { qw_seen = qw; t_rx = t; limit = SSB_SILENCE_US * (CPU_HZ / 1000000u); }
-            else if (t - t_rx > limit) break;
-        }
+        ++cycles;
     }
-    c->qw = qw; c->qr = qr; c->under = under; c->late = late; c->blocks = blocks; c->pairs = pairs;
+out:
+    c->qw = qw; c->qr = qr; c->under = under; c->late = late; c->blocks = cycles * (SSB_INTERP / CW_BLOCK); c->pairs = pairs;
     return 0;
 }
 
