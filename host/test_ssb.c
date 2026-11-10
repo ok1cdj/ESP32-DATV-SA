@@ -1,8 +1,8 @@
 /* Checks the SSB path of the CW beacon firmware (firmware/main/cw_lut.h): the loop's integer interpolation and NCO rotation.
  *   gcc -O2 -o /tmp/test_ssb test_ssb.c -lm && /tmp/test_ssb out.bin [tone1_hz [tone2_hz [amp [nco_hz]]]]
- * Feeds the analytic signal of one tone (tone2 0) or two equal tones at 62.5 kS/s, as the host sends it (int16, the sum at
+ * Feeds the analytic signal of one tone (tone2 0) or two equal tones at 50 kS/s, as the host sends it (int16, the sum at
  * 0.9 of full scale), through the arithmetic of ssb_loop() in main.c for 0.5 s and writes the int16 I, Q pairs of the DAC at
- * 2 MS/s (the words decoded) for a spectrum check; prints PASS / FAIL for the amplitude. */
+ * 1.6 MS/s (the words decoded) for a spectrum check; prints PASS / FAIL for the amplitude. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -10,7 +10,7 @@
 #pragma GCC diagnostic ignored "-Wunused-function"          /* the CW part of the header */
 #include "../firmware/main/cw_lut.h"
 
-#define FS 2000000.0
+#define FS 1600000.0                           /* SSB_FS of main.c */
 #define IN (FS / SSB_INTERP)
 
 static int dac(uint32_t w, int field) {
@@ -22,11 +22,9 @@ int main(int argc, char **argv) {
     const double f1 = argc > 2 ? atof(argv[2]) : 1000.0, f2 = argc > 3 ? atof(argv[3]) : 0.0;
     const int amp = argc > 4 ? atoi(argv[4]) : 100;
     const double nco = argc > 5 ? atof(argv[5]) : 20000.0;
-    static int16_t c[SSB_SIN_N], s[SSB_SIN_N], sp[SSB_SIN_N], cp[SSB_SIN_N];
-    ssb_tables(c, s, sp, cp, 1.0f, 0.0f);
-    int32_t di[CW_BLOCK], dq[CW_BLOCK];
-    cw_dc_pattern(di, 0.0f);
-    cw_dc_pattern(dq, 0.0f);
+    static ssb_tab_t tab[SSB_SIN_N];
+    ssb_tables(tab, 1.0f, 0.0f);
+    const int16_t dc[2] = {0, 0};
     const uint32_t inc = (uint32_t)(int32_t)llround(nco / FS * 4294967296.0);
     const uint32_t npairs = (uint32_t)(0.5 * IN);
     FILE *f = fopen(argv[1], "wb");
@@ -46,7 +44,7 @@ int main(int argc, char **argv) {
             u += du;
             v += dv;
             phase += inc;
-            const uint32_t w = ssb_word(u, v, phase, c, s, sp, cp, di[k & (CW_BLOCK - 1u)], dq[k & (CW_BLOCK - 1u)]);
+            const uint32_t w = ssb_word(u, v, phase, tab, dc);
             const int16_t iq[2] = {(int16_t)dac(w, 0), (int16_t)dac(w, 1)};
             if (abs(iq[0]) > peak) peak = abs(iq[0]);
             fwrite(iq, sizeof(iq), 1, f);

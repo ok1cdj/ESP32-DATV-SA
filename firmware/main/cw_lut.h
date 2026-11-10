@@ -113,26 +113,28 @@ static inline uint32_t cw_word(int32_t a, uint32_t phase, const int16_t *ci, con
  * Tables Q13, SSB_SIN_N entries each (four of them). */
 #define SSB_SIN_BITS 11u
 #define SSB_SIN_N    (1u << SSB_SIN_BITS)
-#define SSB_INTERP   32u                 /* DAC samples per input sample: 2 MS/s / 62.5 kS/s */
+#define SSB_INTERP   32u                 /* DAC samples per input sample (main.c: 1.6 MS/s / 50 kS/s) */
 
-static void ssb_tables(int16_t *c, int16_t *s, int16_t *sp, int16_t *cp, float g, float phi_deg) {
+/* One table entry per NCO step: cos x, sin x, g sin(x + phi), g cos(x + phi) (interleaved: one pointer in the loop). */
+typedef struct { int16_t c, s, sp, cp; } ssb_tab_t;
+
+static void ssb_tables(ssb_tab_t *t, float g, float phi_deg) {
     const float pi = 3.14159265f, ph = phi_deg * pi / 180.0f;
     for (uint32_t k = 0; k < SSB_SIN_N; ++k) {
         const float x = 2.0f * pi * (float)k / (float)SSB_SIN_N;
-        c[k] = (int16_t)lroundf(8192.0f * cosf(x));
-        s[k] = (int16_t)lroundf(8192.0f * sinf(x));
-        sp[k] = (int16_t)lroundf(8192.0f * g * sinf(x + ph));
-        cp[k] = (int16_t)lroundf(8192.0f * g * cosf(x + ph));
+        t[k].c = (int16_t)lroundf(8192.0f * cosf(x));
+        t[k].s = (int16_t)lroundf(8192.0f * sinf(x));
+        t[k].sp = (int16_t)lroundf(8192.0f * g * sinf(x + ph));
+        t[k].cp = (int16_t)lroundf(8192.0f * g * cosf(x + ph));
     }
 }
 
-/* One DAC word: u, v the interpolated baseband in DAC codes x 2^15 (|u|, |v| <= AMP x 2^15). */
-static inline uint32_t ssb_word(int32_t u15, int32_t v15, uint32_t phase, const int16_t *c, const int16_t *s, const int16_t *sp,
-                                const int16_t *cp, int32_t di, int32_t dq) {
-    const uint32_t k = phase >> (32u - SSB_SIN_BITS);
+/* One DAC word: u, v the interpolated baseband in DAC codes x 2^15 (|u|, |v| <= AMP x 2^15), dc the DC correction (I, Q). */
+static inline uint32_t ssb_word(int32_t u15, int32_t v15, uint32_t phase, const ssb_tab_t *tab, const int16_t *dc) {
+    const ssb_tab_t *e = &tab[phase >> (32u - SSB_SIN_BITS)];
     const int32_t u = u15 >> 11, v = v15 >> 11;               /* codes x 16: the fraction survives the rotation (<= 7680 x 8192 x 2) */
-    const int32_t i = ((u * c[k] - v * s[k] + (1 << 16)) >> 17) + di;
-    const int32_t q = ((u * sp[k] + v * cp[k] + (1 << 16)) >> 17) + dq;
+    const int32_t i = ((u * e->c - v * e->s + (1 << 16)) >> 17) + dc[0];
+    const int32_t q = ((u * e->sp + v * e->cp + (1 << 16)) >> 17) + dc[1];
     return ((uint32_t)i & 0x3FFu) | (((uint32_t)q & 0x3FFu) << 10);
 }
 

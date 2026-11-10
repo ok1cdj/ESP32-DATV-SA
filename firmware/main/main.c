@@ -17,7 +17,7 @@
  *   QPSKT f_MHz baud sps [amp [seconds [ifm [target [dcI dcQ [g phi]]]]]]   see qpsk_lut.h and README.md
  *   PSK8T ...same arguments   8PSK from the generic loop (3 bit symbols, 16..64 samples per symbol at 8 MS/s)
  *   CW [INFO | ON | OFF | SET key value | SAVE | DEFAULTS]   CW beacon: NCO carrier keyed with Morse text, then a long carrier
- *   SSB ON   USB from the host: int16 I, Q at 62.5 kS/s after the OK line, at the CW beacon's F, NCO, AMP, PA (see ssb_run)
+ *   SSB ON   USB from the host: int16 I, Q at 50 kS/s after the OK line, at the CW beacon's F, NCO, AMP, PA (see ssb_run)
  *   BDC [GET [f_MHz] | i q | SAVE | PUT f_MHz i q | LIST | RESET | TEST on [f_MHz] | off]   beacon DC correction [DAC codes]
  *                              against the carrier leakage: show / set by hand and restart the beacon / keep for the current frequency
  *                              in the NVS table / put an entry into it / list it / back to the built-in values of beacon_cfg.h /
@@ -1781,53 +1781,58 @@ static void cw_command(const char *arg) {
 
 /* ------------------------------------------------------------ SSB from the host (cw_lut.h)
  * SSB ON: the host streams the analytic signal (USB: spectrum above 0 Hz) as int16 I, Q pairs (little endian) at
- * SSB_IN_RATE; the loop interpolates it linearly to CW_FS, applies AMP, rotates it by the NCO to the CW beacon's frequency F
+ * SSB_IN_RATE; the loop interpolates it linearly to SSB_FS, applies AMP, rotates it by the NCO to the CW beacon's frequency F
  * (LO = F - NCO, the DC and I/Q corrections of the beacon) and writes the DAC, from the same kind of C loop as the CW beacon.
- * Only the bytes are read in the loop (slots 2, 6, 10, 14 of a block: up to 4 bytes a block, twice what the stream needs); a
+ * The bytes are read at the start of each block (up to 4, twice what the stream needs); a
  * fill report (0xB7, fill in pairs, 2 bytes, underruns, 1 byte) goes to the host every SSB_REPORT blocks so that it can pace
  * itself. The transmitter goes off when the host is silent for SSB_SILENCE_US (3 s before the first byte), the PTT of the host:
  * it stops sending. Underruns send silence (the carrier stays suppressed). */
-#define SSB_IN_RATE    (CW_FS / SSB_INTERP)  /* 62500 pairs per second */
-#define SSB_RING       32768u                /* bytes: 8192 pairs = 131 ms */
+#define SSB_FS         1600000u              /* DAC samples per second: 100 CPU cycles a sample (2 MS/s left too little room:
+                                                each block's USB read and input pair made late samples, lines at +-62.5 kHz) */
+#define SSB_IN_RATE    (SSB_FS / SSB_INTERP) /* 50000 pairs per second */
+#define SSB_RING       32768u                /* bytes: 8192 pairs = 164 ms */
 #define SSB_REPORT     512u                  /* blocks between fill reports (4 ms) */
 #define SSB_SILENCE_US 500000u
 _Static_assert(SSB_INTERP == 2u * CW_BLOCK, "an input pair every two blocks");
+_Static_assert(CPU_HZ % SSB_FS == 0, "SSB_FS must divide the CPU clock");
 
 typedef struct {
     uint8_t *ring;
-    const int16_t *c, *s, *sp, *cp;
-    int32_t di[CW_BLOCK], dq[CW_BLOCK];
+    const ssb_tab_t *tab;
+    int16_t dc[CW_BLOCK][2];                                         /* the DC correction per sample of a block (I, Q) */
     uint32_t inc, amp;
     uint32_t qw, qr, under, late, blocks, pairs;
 } ssb_ctx_t;
 
+/* Few live values in the sample loop (RV32 has to keep them in registers): one table pointer, one DC pointer, and the USB bytes
+ * read once a block, up to 4 (the stream needs 2), so that the first sample of a block may come late and the others catch up. */
 static int __attribute__((noinline)) ssb_loop(ssb_ctx_t *c) {
-    const int16_t *const tc = c->c, *const ts = c->s, *const tsp = c->sp, *const tcp = c->cp;
+    const ssb_tab_t *const tab = c->tab;
     uint8_t *const ring = c->ring;
-    const uint32_t inc = c->inc, amp = c->amp, period = CPU_HZ / CW_FS;
+    const uint32_t inc = c->inc, amp = c->amp, period = CPU_HZ / SSB_FS, m = SSB_RING - 1u;
     uint32_t qw = 0, qr = 0, under = 0, late = 0, blocks = 0, pairs = 0, phase = 0, qw_seen = 0;
     int32_t u = 0, v = 0, du = 0, dv = 0;
-    uint32_t word = ssb_word(0, 0, 0, tc, ts, tsp, tcp, c->di[0], c->dq[0]), tn = ccount() + 20000u, t_rx = tn;
+    uint32_t word = ssb_word(0, 0, 0, tab, c->dc[0]), tn = ccount() + 20000u, t_rx = tn;
     uint32_t limit = 3u * CPU_HZ;                                    /* before the first byte */
     for (;;) {
+        for (uint32_t n = 0; n < 4u && qw - qr < m && USB_SERIAL_JTAG.ep1_conf.serial_out_ep_data_avail; ++n)
+            ring[qw++ & m] = (uint8_t)USB_SERIAL_JTAG.ep1.val;
+        const int16_t (*dc)[2] = c->dc;
         for (uint32_t j = 0; j < CW_BLOCK; ++j) {
             uint32_t now;
             do { now = ccount(); } while ((int32_t)(now - tn) < 0);
             DAC_BUF[0] = word;
             late += now - tn > 8u;
             tn += period;
-            if ((j & 3u) == 2u && qw - qr < SSB_RING - 1u && USB_SERIAL_JTAG.ep1_conf.serial_out_ep_data_avail)
-                ring[qw++ & (SSB_RING - 1u)] = (uint8_t)USB_SERIAL_JTAG.ep1.val;
             u += du;
             v += dv;
             phase += inc;
-            word = ssb_word(u, v, phase, tc, ts, tsp, tcp, c->di[(j + 1u) & (CW_BLOCK - 1u)], c->dq[(j + 1u) & (CW_BLOCK - 1u)]);
+            word = ssb_word(u, v, phase, tab, dc[(j + 1u) & (CW_BLOCK - 1u)]);
         }
         ++blocks;
         if (!(blocks & 1u)) {                                        /* the next input pair: the steps to it over SSB_INTERP samples */
             int32_t ti = 0, tq = 0;
             if (qw - qr >= 4u) {
-                const uint32_t m = SSB_RING - 1u;
                 ti = (int16_t)(ring[qr & m] | ring[(qr + 1u) & m] << 8);
                 tq = (int16_t)(ring[(qr + 2u) & m] | ring[(qr + 3u) & m] << 8);
                 qr += 4u;
@@ -1866,15 +1871,17 @@ static void ssb_run(void) {
     dc_for(lo_khz, &dci, &dcq, &src);
     if (cfg.amp + fmaxf(fabsf(dci), fabsf(dcq)) > 510.0f) { say("ERR SSB AMP + DC over 510\r\n"); return; }
     uint8_t *ring = malloc(SSB_RING);
-    int16_t *tabs = malloc(4u * SSB_SIN_N * sizeof(int16_t));
+    ssb_tab_t *tabs = malloc(SSB_SIN_N * sizeof(ssb_tab_t));
     if (!ring || !tabs) { free(ring); free(tabs); say("ERR SSB no memory\r\n"); return; }
-    ssb_ctx_t c = {.ring = ring, .c = tabs, .s = tabs + SSB_SIN_N, .sp = tabs + 2u * SSB_SIN_N, .cp = tabs + 3u * SSB_SIN_N, .amp = cfg.amp};
-    ssb_tables(tabs, tabs + SSB_SIN_N, tabs + 2u * SSB_SIN_N, tabs + 3u * SSB_SIN_N, BEACON_IQ_GAIN, BEACON_IQ_PHASE);
-    cw_dc_pattern(c.di, dci);
-    cw_dc_pattern(c.dq, dcq);
+    ssb_ctx_t c = {.ring = ring, .tab = tabs, .amp = cfg.amp};
+    ssb_tables(tabs, BEACON_IQ_GAIN, BEACON_IQ_PHASE);
+    int32_t di[CW_BLOCK], dq[CW_BLOCK];
+    cw_dc_pattern(di, dci);
+    cw_dc_pattern(dq, dcq);
+    for (uint32_t j = 0; j < CW_BLOCK; ++j) { c.dc[j][0] = (int16_t)di[j]; c.dc[j][1] = (int16_t)dq[j]; }
     if (!tune(lo_khz)) { free(ring); free(tabs); say("ERR SSB TUNE\r\n"); return; }
     const double nco = cfg.fhz - lo_hz;
-    c.inc = (uint32_t)(int32_t)llround(nco / CW_FS * 4294967296.0);
+    c.inc = (uint32_t)(int32_t)llround(nco / SSB_FS * 4294967296.0);
     panel_show("SSB (USB)", cfg.pa, cfg.fhz / 1000u, "stream from PC", NULL, NULL, NULL);
     const uint32_t owner0 = rd(SRAM_OWNER);
     pa_set(cfg.pa);
@@ -1884,7 +1891,7 @@ static void ssb_run(void) {
     DAC_BUF[0] = 0;
     usb_drain_rx();
     say("OK SSB LO %.0f NCO %.3f F %.3f AMP %u RATE %u RING %u DC %.2f %.2f (%s) PA %u\r\n", lo_hz,
-        (double)(int32_t)c.inc * CW_FS / 4294967296.0, lo_hz + (double)(int32_t)c.inc * CW_FS / 4294967296.0, (unsigned)cfg.amp,
+        (double)(int32_t)c.inc * SSB_FS / 4294967296.0, lo_hz + (double)(int32_t)c.inc * SSB_FS / 4294967296.0, (unsigned)cfg.amp,
         (unsigned)SSB_IN_RATE, (unsigned)(SSB_RING / 4u), (double)dci, (double)dcq, src, (unsigned)cfg.pa);
     taskENTER_CRITICAL(&stream_mux);
     wr(SRAM_OWNER, (owner0 & ~7u) | 2u | 8u);
