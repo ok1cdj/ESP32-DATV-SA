@@ -17,6 +17,7 @@
  *   QPSKT f_MHz baud sps [amp [seconds [ifm [target [dcI dcQ [g phi]]]]]]   see qpsk_lut.h and README.md
  *   PSK8T ...same arguments   8PSK from the generic loop (3 bit symbols, 16..64 samples per symbol at 8 MS/s)
  *   CW [INFO | ON | OFF | SET key value | SAVE | DEFAULTS]   CW beacon: NCO carrier keyed with Morse text, then a long carrier
+ *   CW SEND text   the text once in Morse at the beacon's F, AMP, WPM, then back to the beacon (if on) or off
  *   SSB ON   USB from the host: int16 I, Q at 50 kS/s after the OK line, at the CW beacon's F, NCO, AMP, PA (see ssb_run)
  *   BDC [GET [f_MHz] | i q | SAVE | PUT f_MHz i q | LIST | RESET | TEST on [f_MHz] | off]   beacon DC correction [DAC codes]
  *                              against the carrier leakage: show / set by hand and restart the beacon / keep for the current frequency
@@ -1532,7 +1533,11 @@ static int beacon_run(void) {
  *   CW ON | OFF             the CW beacon instead of the DVB-S2 one / off (OFF: the transmitter stays off, as after INFO)
  *   CW SET key value        F f_MHz (carrier), NCO Hz, AMP 1..480, WPM 5..60, TEXT ..., CARRIER s 0..600, RISE ms 0.5..20, PA 0|1,
  *                           AUTO 0|1 (the CW beacon at power-up)
- *   CW SAVE | DEFAULTS      the settings into the NVS ("cw"/"cfg") / back to the built-in ones (not saved) */
+ *   CW SAVE | DEFAULTS      the settings into the NVS ("cw"/"cfg") / back to the built-in ones (not saved)
+ *   CW SEND text            the text once (no long carrier) with the beacon's settings: "CW SEND text" when it starts, "CW SENT"
+ *                           when done, "CW SEND STOPPED" when a byte from the host (e.g. CW OFF) or panel input cut it short;
+ *                           afterwards the beacon runs again if it is on, else the transmitter stays off. Characters
+ *                           without Morse code are refused. */
 #include "cw_lut.h"
 #define CW_FS        2000000u            /* DAC samples per second: 80 CPU cycles a sample */
 #define CW_RUNS_MAX  1024u
@@ -1554,7 +1559,7 @@ typedef struct {
 
 static const cw_cfg_t cw_defaults = {
     .autostart = 0, .pa = 0, .amp = 100, .fhz = 2320050000u, .nco_hz = 20000, .wpm = 15, .carrier_s = 10, .rise_100us = 50,
-    .text = "VVV DE OK1CDJ",
+    .text = "VVV DE NOCALL",                /* the host sets the callsign (CW SET TEXT) */
 };
 static cw_cfg_t cw_cfg;
 static bool cw_on;                       /* the main loop runs the CW beacon instead of the DVB-S2 one */
@@ -1600,16 +1605,17 @@ typedef struct {
     const int16_t *ci, *cq;
     int32_t di[CW_BLOCK], dq[CW_BLOCK];
     uint32_t nruns, R, inc;
+    bool once;                                                       /* CW SEND: the runs once, then return 6 */
     uint32_t late, blocks;
 } cw_ctx_t;
 
-/* The loop: interrupts are off, returns 3 for a byte from the host, 4 for panel input. It runs from the flash cache (IRAM is full up to
+/* The loop: interrupts are off, returns 3 for a byte from the host, 4 for panel input, 6 at the end of the runs (once). It runs from the flash cache (IRAM is full up to
  * the RF dump bank); nothing else runs meanwhile, so after the first passes it stays in the cache, as lutf.S does. */
 static int __attribute__((noinline)) cw_loop(cw_ctx_t *c) {
     const int16_t *const ci = c->ci, *const cq = c->cq;
     const uint32_t inc = c->inc, R = c->R, period = CPU_HZ / CW_FS;
     uint32_t r = 0, left = (uint32_t)(c->runs[0] > 0 ? c->runs[0] : -c->runs[0]), e = 0, phase = 0, late = 0, blocks = 0, chk = CW_CHECK;
-    bool key = c->runs[0] > 0;
+    bool key = c->runs[0] > 0, done = false;
     int32_t a = 0;
     uint32_t word = cw_word(0, 0, ci, cq, c->di[0], c->dq[0]), tn = ccount() + 20000u;
     int why;
@@ -1629,13 +1635,20 @@ static int __attribute__((noinline)) cw_loop(cw_ctx_t *c) {
         /* the envelope steps once a block; the new a applies from the second sample of the next block */
         ++blocks;
         if (!--left) {
-            if (++r == c->nruns) r = 0;
-            key = c->runs[r] > 0;
-            left = (uint32_t)(key ? c->runs[r] : -c->runs[r]);
+            if (++r == c->nruns && c->once) {                        /* the runs end with key up: wait for the envelope */
+                done = true;
+                key = false;
+                left = UINT32_MAX;
+            } else {
+                if (r == c->nruns) r = 0;
+                key = c->runs[r] > 0;
+                left = (uint32_t)(key ? c->runs[r] : -c->runs[r]);
+            }
         }
         if (key) { if (e < R) ++e; }
         else if (e) --e;
         a = c->ramp[e];
+        if (done && !e) { why = 6; break; }
         if (!--chk) {
             chk = CW_CHECK;
             if (USB_SERIAL_JTAG.ep1_conf.serial_out_ep_data_avail) { why = 3; break; }
@@ -1647,9 +1660,10 @@ static int __attribute__((noinline)) cw_loop(cw_ctx_t *c) {
     return why;
 }
 
-/* Returns 3: a byte from the host, 4: panel input, 0: could not start (the reason went to USB and the screen). */
-static int cw_run(void) {
-    const cw_cfg_t cfg = cw_cfg;
+/* Transmits cfg's text (and long carrier), repeated, or once. Returns 3: a byte from the host, 4: panel input, 6: sent once,
+ * 0: could not start (the reason went to USB and the screen). */
+static int cw_start(const cw_cfg_t *cfgp, bool once) {
+    const cw_cfg_t cfg = *cfgp;
     const uint32_t lo_khz = cw_lo_khz(&cfg);
     if (!lo_khz) return beacon_fail("CW frequency", NULL, NULL, NULL);
     float dci, dcq;
@@ -1664,7 +1678,7 @@ static int cw_run(void) {
     int32_t *ramp = malloc((R + 1u) * sizeof(int32_t));
     int16_t *tabs = malloc(2u * CW_SIN_N * sizeof(int16_t));
     if (!runs || !ramp || !tabs) { free(tabs); return beacon_fail("no memory", runs, ramp, NULL); }
-    cw_ctx_t c = {.runs = runs, .ramp = ramp, .ci = tabs, .cq = tabs + CW_SIN_N, .R = R};
+    cw_ctx_t c = {.runs = runs, .ramp = ramp, .ci = tabs, .cq = tabs + CW_SIN_N, .R = R, .once = once};
     c.nruns = cw_build_runs(runs, CW_RUNS_MAX, cfg.text, (int32_t)unit, (int32_t)((uint64_t)cfg.carrier_s * CW_FS / CW_BLOCK));
     if (!c.nruns) { free(tabs); return beacon_fail("CW nothing to send", runs, ramp, NULL); }
     cw_ramp(ramp, R, (float)cfg.amp);
@@ -1681,7 +1695,7 @@ static int cw_run(void) {
     snprintf(l4, sizeof(l4), "NCO %+ld Hz", (long)cfg.nco_hz);
     snprintf(l5, sizeof(l5), "%u WPM amp %u", (unsigned)cfg.wpm, (unsigned)cfg.amp);
     panel_error(NULL);
-    panel_show("CW BEACON", cfg.pa, cfg.fhz / 1000u, l4, l5, cfg.text, NULL);
+    panel_show(once ? "CW SEND" : "CW BEACON", cfg.pa, cfg.fhz / 1000u, l4, l5, cfg.text, NULL);
     const uint32_t owner0 = rd(SRAM_OWNER);
     pa_set(cfg.pa);
     if (cfg.pa) esp_rom_delay_us(5000);
@@ -1706,8 +1720,27 @@ static int cw_run(void) {
     free(tabs);
     free(ramp);
     free(runs);
-    say("CW END %s late %lu of %lu samples\r\n", why == 3 ? "host" : "panel", (unsigned long)c.late, (unsigned long)(c.blocks * CW_BLOCK));
+    if (why == 6) say("CW SENT late %lu of %lu samples\r\n", (unsigned long)c.late, (unsigned long)(c.blocks * CW_BLOCK));
+    else say("%s %s late %lu of %lu samples\r\n", once ? "CW SEND STOPPED" : "CW END", why == 3 ? "host" : "panel",
+             (unsigned long)c.late, (unsigned long)(c.blocks * CW_BLOCK));
     return why;
+}
+static int cw_run(void) { return cw_start(&cw_cfg, false); }
+
+/* CW SEND text: once, with the beacon's settings and no long carrier. Blocks like the beacon; a byte from the host stops it. */
+static void cw_send(const char *text) {
+    cw_cfg_t c = cw_cfg;
+    const size_t n = strlen(text);
+    if (!n || n > CW_TEXT_MAX) { say("ERR CW SEND: 1..%u characters\r\n", CW_TEXT_MAX); return; }
+    memset(c.text, 0, sizeof(c.text));
+    for (size_t i = 0; i < n; ++i) {
+        const char ch = (text[i] >= 'a' && text[i] <= 'z') ? (char)(text[i] - 'a' + 'A') : text[i];
+        if (ch != ' ' && !cw_code(ch)) { say("ERR CW SEND: no Morse code for '%c'\r\n", ch); return; }
+        c.text[i] = ch;
+    }
+    c.carrier_s = 0;
+    say("CW SEND %s\r\n", c.text);
+    cw_start(&c, true);
 }
 
 /* CW commands (the line after "CW"). */
@@ -1716,6 +1749,14 @@ static void cw_command(const char *arg) {
     if (!*arg || !strcmp(arg, "INFO")) {
         cw_say();
         if (cw_on) {                                                 /* the command's byte stopped the beacon: on again */
+            host_seen = false;
+            beacon_restart = true;
+        }
+        return;
+    }
+    if (!strncmp(arg, "SEND ", 5)) {
+        cw_send(arg + 5);
+        if (cw_on) {                                                 /* the beacon again after the text */
             host_seen = false;
             beacon_restart = true;
         }
@@ -1769,7 +1810,7 @@ static void cw_command(const char *arg) {
         if (cw_on && !cw_lo_khz(&c)) { say("ERR CW frequency: carrier and LO within %u..%u MHz\r\n", TX_FMIN_KHZ / 1000u, TX_FMAX_KHZ / 1000u); return; }
         cw_cfg = c;
     } else {
-        say("ERR CW [INFO] | ON | OFF | SET key value | SAVE | DEFAULTS\r\n");
+        say("ERR CW [INFO] | ON | OFF | SET key value | SAVE | DEFAULTS | SEND text\r\n");
         return;
     }
     cw_say();
